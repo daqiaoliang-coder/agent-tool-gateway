@@ -1,5 +1,5 @@
-bin/
-coverage.out
+/bin/
+/coverage.out
 *.log
 .env
 configs/gateway.json

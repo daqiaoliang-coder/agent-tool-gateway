@@ -1,0 +1,47 @@
+{
+  "listen_addr": ":8080",
+  "server_name": "agent-tool-gateway",
+  "server_version": "0.1.0",
+  "request_timeout": "10s",
+  "max_request_bytes": 1048576,
+  "max_response_bytes": 1048576,
+  "max_concurrent_tool_calls": 64,
+  "metrics_token_env": "ATG_METRICS_TOKEN",
+  "clients": [
+    {
+      "id": "demo-client",
+      "token_env": "ATG_DEMO_CLIENT_TOKEN",
+      "allowed_tools": ["service_health", "echo_message"]
+    }
+  ],
+  "tools": [
+    {
+      "name": "service_health",
+      "description": "Read the health status of the configured demo backend.",
+      "method": "GET",
+      "endpoint": "http://127.0.0.1:9090/healthz",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "echo_message",
+      "description": "Send a message to the demo backend and return its response.",
+      "method": "POST",
+      "endpoint": "http://127.0.0.1:9090/echo",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "Message to echo."
+          }
+        },
+        "required": ["message"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}
