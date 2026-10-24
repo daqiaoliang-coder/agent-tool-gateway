@@ -41,24 +41,37 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	reloadSignals := make(chan os.Signal, 1)
+	signal.Notify(reloadSignals, syscall.SIGHUP)
+	defer signal.Stop(reloadSignals)
 	serveErr := make(chan error, 1)
 	go func() {
 		logger.Info("agent tool gateway listening", "addr", cfg.ListenAddr)
 		serveErr <- server.ListenAndServe()
 	}()
 
-	select {
-	case err := <-serveErr:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("serve gateway", "error", err)
-			os.Exit(1)
-		}
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			logger.Error("shutdown gateway", "error", err)
-			os.Exit(1)
+	for {
+		select {
+		case <-reloadSignals:
+			if err := g.ReloadCredentials(); err != nil {
+				logger.Error("credential reload rejected; previous credentials remain active", "error", err)
+			} else {
+				logger.Info("credentials reloaded")
+			}
+		case err := <-serveErr:
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("serve gateway", "error", err)
+				os.Exit(1)
+			}
+			return
+		case <-ctx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := server.Shutdown(shutdownCtx); err != nil {
+				logger.Error("shutdown gateway", "error", err)
+				os.Exit(1)
+			}
+			return
 		}
 	}
 }

@@ -26,6 +26,7 @@ type Config struct {
 	MaxResponseBytes       int64    `json:"max_response_bytes"`
 	MaxConcurrentToolCalls int      `json:"max_concurrent_tool_calls"`
 	MetricsTokenEnv        string   `json:"metrics_token_env,omitempty"`
+	CredentialsFile        string   `json:"credentials_file,omitempty"`
 	Clients                []Client `json:"clients"`
 	Tools                  []Tool   `json:"tools"`
 	requestTimeout         time.Duration
@@ -38,12 +39,13 @@ type Client struct {
 }
 
 type Tool struct {
-	Name            string          `json:"name"`
-	Description     string          `json:"description"`
-	Method          string          `json:"method"`
-	Endpoint        string          `json:"endpoint"`
-	BackendTokenEnv string          `json:"backend_token_env,omitempty"`
-	InputSchema     json.RawMessage `json:"input_schema"`
+	Name                 string          `json:"name"`
+	Description          string          `json:"description"`
+	Method               string          `json:"method"`
+	Endpoint             string          `json:"endpoint"`
+	BackendTokenEnv      string          `json:"backend_token_env,omitempty"`
+	BackendTokenRequired bool            `json:"backend_token_required,omitempty"`
+	InputSchema          json.RawMessage `json:"input_schema"`
 }
 
 func Load(path string) (Config, error) {
@@ -106,6 +108,10 @@ func (c *Config) Validate() error {
 	if c.MaxConcurrentToolCalls <= 0 {
 		c.MaxConcurrentToolCalls = 64
 	}
+	fileCredentials := c.CredentialsFile != ""
+	if fileCredentials && c.MetricsTokenEnv != "" {
+		return errors.New("metrics_token_env must be empty when credentials_file is set")
+	}
 	if err := validateEnvName(c.MetricsTokenEnv); err != nil {
 		return fmt.Errorf("metrics_token_env: %w", err)
 	}
@@ -143,6 +149,12 @@ func (c *Config) Validate() error {
 		if err := json.Unmarshal(t.InputSchema, &schema); err != nil || schema.Type != "object" {
 			return fmt.Errorf("tool %q input_schema must have type object", t.Name)
 		}
+		if fileCredentials && t.BackendTokenEnv != "" {
+			return fmt.Errorf("tool %q backend_token_env must be empty when credentials_file is set", t.Name)
+		}
+		if !fileCredentials && t.BackendTokenRequired && t.BackendTokenEnv == "" {
+			return fmt.Errorf("tool %q backend_token_env is required when backend_token_required is true", t.Name)
+		}
 		if err := validateEnvName(t.BackendTokenEnv); err != nil {
 			return fmt.Errorf("tool %q backend_token_env: %w", t.Name, err)
 		}
@@ -157,10 +169,13 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate client id %q", client.ID)
 		}
 		clientIDs[client.ID] = struct{}{}
+		if fileCredentials && client.TokenEnv != "" {
+			return fmt.Errorf("client %q token_env must be empty when credentials_file is set", client.ID)
+		}
 		if err := validateEnvName(client.TokenEnv); err != nil {
 			return fmt.Errorf("client %q token_env: %w", client.ID, err)
 		}
-		if client.TokenEnv == "" {
+		if !fileCredentials && client.TokenEnv == "" {
 			return fmt.Errorf("client %q token_env is required", client.ID)
 		}
 		if len(client.AllowedTools) == 0 {

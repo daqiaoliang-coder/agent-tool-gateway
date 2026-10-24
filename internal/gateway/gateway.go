@@ -12,8 +12,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daqiaoliang-coder/agent-tool-gateway/internal/config"
@@ -21,21 +22,25 @@ import (
 )
 
 type Gateway struct {
-	cfg           config.Config
-	logger        *slog.Logger
-	client        *http.Client
-	credentials   []clientCredential
-	backendTokens map[string]string
-	metricsToken  string
-	metrics       *metrics
-	toolSlots     chan struct{}
-	mcpHandler    http.Handler
+	cfg        config.Config
+	logger     *slog.Logger
+	client     *http.Client
+	identities map[string]clientIdentity
+	secrets    atomic.Pointer[credentialSnapshot]
+	reloadMu   sync.Mutex
+	metrics    *metrics
+	toolSlots  chan struct{}
+	mcpHandler http.Handler
 }
 
-type clientCredential struct {
+type clientIdentity struct {
 	id      string
-	token   string
 	allowed map[string]struct{}
+}
+
+type authenticatedClient struct {
+	clientIdentity
+	credentials *credentialSnapshot
 }
 
 type identityContextKey struct{}
@@ -46,11 +51,11 @@ func New(cfg config.Config, logger *slog.Logger) (*Gateway, error) {
 		logger = slog.Default()
 	}
 	g := &Gateway{
-		cfg:           cfg,
-		logger:        logger,
-		backendTokens: make(map[string]string),
-		metrics:       newMetrics(),
-		toolSlots:     make(chan struct{}, cfg.MaxConcurrentToolCalls),
+		cfg:        cfg,
+		logger:     logger,
+		identities: make(map[string]clientIdentity, len(cfg.Clients)),
+		metrics:    newMetrics(),
+		toolSlots:  make(chan struct{}, cfg.MaxConcurrentToolCalls),
 		client: &http.Client{
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
@@ -58,53 +63,65 @@ func New(cfg config.Config, logger *slog.Logger) (*Gateway, error) {
 		},
 	}
 
+	snapshot, err := loadCredentials(cfg)
+	if err != nil {
+		return nil, err
+	}
+	g.secrets.Store(snapshot)
 	for _, client := range cfg.Clients {
-		token := strings.TrimSpace(os.Getenv(client.TokenEnv))
-		if len(token) < 32 {
-			return nil, fmt.Errorf("client %q token environment variable %s must contain at least 32 characters", client.ID, client.TokenEnv)
-		}
 		allowed := make(map[string]struct{}, len(client.AllowedTools))
 		for _, name := range client.AllowedTools {
 			allowed[name] = struct{}{}
 		}
-		g.credentials = append(g.credentials, clientCredential{id: client.ID, token: token, allowed: allowed})
-	}
-	if cfg.MetricsTokenEnv != "" {
-		g.metricsToken = strings.TrimSpace(os.Getenv(cfg.MetricsTokenEnv))
-		if len(g.metricsToken) < 32 {
-			return nil, fmt.Errorf("metrics token environment variable %s must contain at least 32 characters", cfg.MetricsTokenEnv)
-		}
-	}
-	for _, tool := range cfg.Tools {
-		if tool.BackendTokenEnv == "" {
-			continue
-		}
-		token := strings.TrimSpace(os.Getenv(tool.BackendTokenEnv))
-		if token == "" {
-			return nil, fmt.Errorf("backend token environment variable %s for tool %q is empty", tool.BackendTokenEnv, tool.Name)
-		}
-		g.backendTokens[tool.Name] = token
+		g.identities[client.ID] = clientIdentity{id: client.ID, allowed: allowed}
 	}
 
-	server := mcp.NewServer(&mcp.Implementation{Name: cfg.ServerName, Version: cfg.ServerVersion}, nil)
-	for i := range cfg.Tools {
-		toolCfg := cfg.Tools[i]
-		tool := &mcp.Tool{
-			Name:        toolCfg.Name,
-			Description: toolCfg.Description,
-			InputSchema: json.RawMessage(toolCfg.InputSchema),
-		}
-		mcp.AddTool(server, tool, func(ctx context.Context, _ *mcp.CallToolRequest, input map[string]any) (*mcp.CallToolResult, any, error) {
-			arguments, err := json.Marshal(input)
-			if err != nil {
-				return nil, nil, fmt.Errorf("encode validated tool input: %w", err)
-			}
-			result, err := g.callTool(ctx, toolCfg, arguments)
-			return result, nil, err
-		})
+	toolsByName := make(map[string]config.Tool, len(cfg.Tools))
+	for _, tool := range cfg.Tools {
+		toolsByName[tool.Name] = tool
 	}
-	g.mcpHandler = mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
-		return server
+	servers := make(map[string]*mcp.Server, len(g.identities))
+	for _, credential := range g.identities {
+		server := mcp.NewServer(&mcp.Implementation{Name: cfg.ServerName, Version: cfg.ServerVersion}, nil)
+		for _, toolCfg := range cfg.Tools {
+			if _, allowed := credential.allowed[toolCfg.Name]; !allowed {
+				continue
+			}
+			tool := &mcp.Tool{
+				Name:        toolCfg.Name,
+				Description: toolCfg.Description,
+				InputSchema: json.RawMessage(toolCfg.InputSchema),
+			}
+			mcp.AddTool(server, tool, func(ctx context.Context, _ *mcp.CallToolRequest, input map[string]any) (*mcp.CallToolResult, any, error) {
+				arguments, err := json.Marshal(input)
+				if err != nil {
+					return nil, nil, fmt.Errorf("encode validated tool input: %w", err)
+				}
+				result, err := g.callTool(ctx, toolCfg, arguments)
+				return result, nil, err
+			})
+		}
+		server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+			return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+				// Hidden tools never reach callTool, so retain denial audits before SDK dispatch.
+				if call, ok := req.(*mcp.CallToolRequest); ok && call.Params != nil {
+					if _, allowed := credential.allowed[call.Params.Name]; !allowed {
+						if tool, known := toolsByName[call.Params.Name]; known {
+							g.logCall(ctx, credential.id, tool, 0, false, time.Now(), "tool_denied")
+						}
+					}
+				}
+				return next(ctx, method, req)
+			}
+		})
+		servers[credential.id] = server
+	}
+	g.mcpHandler = mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
+		credential, ok := r.Context().Value(identityContextKey{}).(authenticatedClient)
+		if !ok {
+			return nil
+		}
+		return servers[credential.id]
 	}, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})
 	return g, nil
 }
@@ -123,16 +140,21 @@ func (g *Gateway) Handler() http.Handler {
 }
 
 func (g *Gateway) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	if g.metricsToken == "" {
+	snapshot := g.secrets.Load()
+	if len(snapshot.Metrics) == 0 {
 		http.NotFound(w, r)
 		return
 	}
-	if !constantTimeBearerMatch(r.Header.Get("Authorization"), g.metricsToken) {
-		w.Header().Set("WWW-Authenticate", "Bearer")
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+	now := time.Now()
+	provided := bearerToken(r.Header.Get("Authorization"))
+	for _, credential := range snapshot.Metrics {
+		if credential.active(now) && constantTimeTokenMatch(provided, credential.Token) {
+			g.metrics.serveHTTP(w, r)
+			return
+		}
 	}
-	g.metrics.serveHTTP(w, r)
+	w.Header().Set("WWW-Authenticate", "Bearer")
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
 }
 
 func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
@@ -148,23 +170,26 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 	g.mcpHandler.ServeHTTP(w, r)
 }
 
-func (g *Gateway) authenticate(header string) (clientCredential, bool) {
-	parts := strings.Fields(header)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-		return clientCredential{}, false
+func (g *Gateway) authenticate(header string) (authenticatedClient, bool) {
+	provided := bearerToken(header)
+	if provided == "" {
+		return authenticatedClient{}, false
 	}
-	provided := parts[1]
-	for _, credential := range g.credentials {
-		if len(provided) == len(credential.token) && subtle.ConstantTimeCompare([]byte(provided), []byte(credential.token)) == 1 {
-			return credential, true
+	snapshot := g.secrets.Load()
+	now := time.Now()
+	for id, credentials := range snapshot.Clients {
+		for _, credential := range credentials {
+			if credential.active(now) && constantTimeTokenMatch(provided, credential.Token) {
+				return authenticatedClient{clientIdentity: g.identities[id], credentials: snapshot}, true
+			}
 		}
 	}
-	return clientCredential{}, false
+	return authenticatedClient{}, false
 }
 
 func (g *Gateway) callTool(ctx context.Context, tool config.Tool, arguments json.RawMessage) (*mcp.CallToolResult, error) {
 	started := time.Now()
-	identity, ok := ctx.Value(identityContextKey{}).(clientCredential)
+	identity, ok := ctx.Value(identityContextKey{}).(authenticatedClient)
 	if !ok {
 		return toolError("missing authenticated client"), nil
 	}
@@ -185,7 +210,7 @@ func (g *Gateway) callTool(ctx context.Context, tool config.Tool, arguments json
 
 	callCtx, cancel := context.WithTimeout(ctx, g.cfg.Timeout())
 	defer cancel()
-	result, status, err := g.forward(callCtx, tool, arguments)
+	result, status, err := g.forward(callCtx, tool, arguments, identity.credentials)
 	if err != nil {
 		g.logCall(ctx, identity.id, tool, status, false, started, "upstream_error")
 		return toolError(err.Error()), nil
@@ -194,7 +219,7 @@ func (g *Gateway) callTool(ctx context.Context, tool config.Tool, arguments json
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(result)}}}, nil
 }
 
-func (g *Gateway) forward(ctx context.Context, tool config.Tool, arguments json.RawMessage) ([]byte, int, error) {
+func (g *Gateway) forward(ctx context.Context, tool config.Tool, arguments json.RawMessage, credentials *credentialSnapshot) ([]byte, int, error) {
 	endpoint, err := url.Parse(tool.Endpoint)
 	if err != nil {
 		return nil, 0, errors.New("configured tool endpoint is invalid")
@@ -231,8 +256,12 @@ func (g *Gateway) forward(ctx context.Context, tool config.Tool, arguments json.
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if token := g.backendTokens[tool.Name]; token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+	if tool.BackendTokenRequired || tool.BackendTokenEnv != "" {
+		credential, ok := credentials.Backends[tool.Name]
+		if !ok || !credential.active(time.Now()) {
+			return nil, 0, errors.New("backend credential is unavailable")
+		}
+		req.Header.Set("Authorization", "Bearer "+credential.Token)
 	}
 	if requestID, ok := ctx.Value(requestIDContextKey{}).(string); ok {
 		req.Header.Set("X-Request-ID", requestID)
@@ -298,12 +327,16 @@ func toolError(message string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: message}}}
 }
 
-func constantTimeBearerMatch(header, expected string) bool {
+func bearerToken(header string) string {
 	parts := strings.Fields(header)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || len(parts[1]) != len(expected) {
-		return false
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		return ""
 	}
-	return subtle.ConstantTimeCompare([]byte(parts[1]), []byte(expected)) == 1
+	return parts[1]
+}
+
+func constantTimeTokenMatch(provided, expected string) bool {
+	return len(provided) == len(expected) && subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
 }
 
 func requestIDMiddleware(next http.Handler) http.Handler {
