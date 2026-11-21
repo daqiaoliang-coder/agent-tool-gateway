@@ -17,6 +17,7 @@ import (
 
 func main() {
 	configPath := flag.String("config", "configs/gateway.json", "path to gateway JSON configuration")
+	check := flag.Bool("check", false, "validate configuration and tool schemas without loading credentials or listening")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -25,7 +26,11 @@ func main() {
 		logger.Error("load configuration", "error", err)
 		os.Exit(1)
 	}
-	g, err := gateway.New(cfg, logger)
+	if *check {
+		logger.Info("configuration valid", "config_revision", cfg.Revision())
+		return
+	}
+	g, err := gateway.NewRuntime(cfg, logger)
 	if err != nil {
 		logger.Error("initialize gateway", "error", err)
 		os.Exit(1)
@@ -44,6 +49,9 @@ func main() {
 	reloadSignals := make(chan os.Signal, 1)
 	signal.Notify(reloadSignals, syscall.SIGHUP)
 	defer signal.Stop(reloadSignals)
+	configSignals := make(chan os.Signal, 1)
+	signal.Notify(configSignals, syscall.SIGUSR1)
+	defer signal.Stop(configSignals)
 	serveErr := make(chan error, 1)
 	go func() {
 		logger.Info("agent tool gateway listening", "addr", cfg.ListenAddr)
@@ -53,11 +61,9 @@ func main() {
 	for {
 		select {
 		case <-reloadSignals:
-			if err := g.ReloadCredentials(); err != nil {
-				logger.Error("credential reload rejected; previous credentials remain active", "error", err)
-			} else {
-				logger.Info("credentials reloaded")
-			}
+			_ = g.ReloadCredentials()
+		case <-configSignals:
+			_ = g.ReloadConfig(*configPath)
 		case err := <-serveErr:
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				logger.Error("serve gateway", "error", err)
@@ -65,6 +71,7 @@ func main() {
 			}
 			return
 		case <-ctx.Done():
+			g.Drain()
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			if err := server.Shutdown(shutdownCtx); err != nil {

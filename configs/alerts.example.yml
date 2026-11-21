@@ -1,0 +1,59 @@
+groups:
+  - name: agent-tool-gateway
+    rules:
+      - alert: GatewayUnavailable
+        expr: up{job="agent-tool-gateway"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Gateway metrics cannot be scraped
+          description: Check process health, network access, and metrics credentials before assuming the gateway is down.
+      - alert: GatewayReloadRejected
+        expr: (agent_tool_gateway_last_reload_success == 0) and on (job, instance, kind) (sum by (job, instance, kind) (agent_tool_gateway_reload_total) > 0)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: The last gateway reload failed
+          description: The previous snapshot remains active. Inspect the reload event, correct the release, and reload again; a rejection is not a successful revocation.
+      - alert: GatewayConcurrencySaturated
+        expr: agent_tool_gateway_in_flight / agent_tool_gateway_concurrency_limit > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Gateway tool capacity is nearly exhausted
+          description: Inspect upstream latency and overloaded outcomes before increasing capacity.
+      - alert: GatewayExecutionFailures
+        expr: (sum by (job, instance, tool) (rate(agent_tool_gateway_tool_calls_total{outcome=~"upstream_error|upstream_http_error|timeout|response_too_large|backend_credential_unavailable|internal_error|overloaded"}[5m])) / sum by (job, instance, tool) (rate(agent_tool_gateway_tool_calls_total[5m])) > 0.05) and on (job, instance, tool) (sum by (job, instance, tool) (increase(agent_tool_gateway_tool_calls_total[5m])) >= 20)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Gateway tool failure ratio exceeds five percent
+          description: Use outcome labels and metadata-only audit events to distinguish credential, capacity, timeout, and upstream failures.
+      - alert: GatewayHighLatency
+        expr: histogram_quantile(0.95, sum by (job, instance, tool, le) (rate(agent_tool_gateway_tool_call_duration_seconds_bucket[5m]))) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Gateway tool p95 latency exceeds two seconds
+          description: Correlate request_id and trace_id with upstream spans; tune this threshold to the tool SLO.
+      - alert: GatewayAuthenticationFailures
+        expr: sum by (job, instance, route) (increase(agent_tool_gateway_http_requests_total{outcome="authentication_failed"}[5m])) > 20
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Repeated gateway authentication failures
+          description: Check credential expiry and client rollout status without collecting bearer headers.
+      - alert: GatewayConfigurationDrift
+        expr: count by (job) (count by (job, revision) (agent_tool_gateway_config_info)) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Gateway replicas have different configuration revisions
+          description: Verify whether a staged rollout is expected; otherwise publish or roll back every replica to the approved revision.

@@ -2,6 +2,8 @@ package config
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,8 +11,13 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 const maxConfigBytes = 1 << 20
@@ -40,6 +47,8 @@ type Client struct {
 
 type Tool struct {
 	Name                 string          `json:"name"`
+	Version              string          `json:"version,omitempty"`
+	State                string          `json:"state,omitempty"`
 	Description          string          `json:"description"`
 	Method               string          `json:"method"`
 	Endpoint             string          `json:"endpoint"`
@@ -49,11 +58,22 @@ type Tool struct {
 }
 
 func Load(path string) (Config, error) {
-	f, err := os.Open(path)
+	// Nonblocking open prevents a FIFO from hanging before we can check its mode.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return Config{}, fmt.Errorf("open config: %w", err)
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return Config{}, fmt.Errorf("stat config: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return Config{}, errors.New("config must be a regular file")
+	}
+	if info.Size() > maxConfigBytes {
+		return Config{}, fmt.Errorf("config exceeds %d bytes", maxConfigBytes)
+	}
 
 	data, err := io.ReadAll(io.LimitReader(f, maxConfigBytes+1))
 	if err != nil {
@@ -62,23 +82,104 @@ func Load(path string) (Config, error) {
 	if len(data) > maxConfigBytes {
 		return Config{}, fmt.Errorf("config exceeds %d bytes", maxConfigBytes)
 	}
-
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	var cfg Config
-	if err := dec.Decode(&cfg); err != nil {
-		return Config{}, fmt.Errorf("decode config: %w", err)
+	// Decoder errors can include secret values or attacker-controlled keys.
+	if !json.Valid(data) {
+		return Config{}, errors.New("decode config: must contain a single valid JSON value")
 	}
-	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return Config{}, errors.New("config must contain a single JSON value")
-		}
-		return Config{}, fmt.Errorf("decode trailing config data: %w", err)
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := checkJSON(dec, "config"); err != nil {
+		return Config{}, fmt.Errorf("decode config at byte %d: %w", dec.InputOffset(), err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Config{}, errors.New("decode config: invalid field type")
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// Only input_schema has an open, case-sensitive vocabulary.
+var configFields = map[string]map[string]string{
+	"config": {
+		"listen_addr": "value", "server_name": "value", "server_version": "value",
+		"request_timeout": "value", "max_request_bytes": "value", "max_response_bytes": "value",
+		"max_concurrent_tool_calls": "value", "metrics_token_env": "value", "credentials_file": "value",
+		"clients": "clients", "tools": "tools",
+	},
+	"client": {"id": "value", "token_env": "value", "allowed_tools": "allowlist"},
+	"tool": {
+		"name": "value", "version": "value", "state": "value", "description": "value",
+		"method": "value", "endpoint": "value", "backend_token_env": "value",
+		"backend_token_required": "value", "input_schema": "input_schema",
+	},
+}
+
+// Struct decoding alone silently accepts duplicate keys, case aliases and nulls.
+func checkJSON(dec *json.Decoder, scope string) error {
+	token, err := dec.Token()
+	if err != nil {
+		return errors.New("invalid JSON")
+	}
+	if token == nil && scope != "schema" {
+		return errors.New("null is not allowed outside input_schema")
+	}
+	fields := configFields[scope]
+	if fields != nil && token != json.Delim('{') {
+		return fmt.Errorf("%s must be an object", scope)
+	}
+	elementScope := "value"
+	switch scope {
+	case "clients":
+		elementScope = "client"
+	case "tools":
+		elementScope = "tool"
+	case "schema", "input_schema":
+		elementScope = "schema"
+	}
+	if (scope == "clients" || scope == "tools" || scope == "allowlist") && token != json.Delim('[') {
+		return fmt.Errorf("%s must be an array", scope)
+	}
+	switch token {
+	case json.Delim('{'):
+		seen := make(map[string]bool)
+		for dec.More() {
+			keyToken, err := dec.Token()
+			if err != nil {
+				return errors.New("invalid JSON")
+			}
+			key := keyToken.(string)
+			if seen[key] {
+				return errors.New("duplicate JSON key")
+			}
+			seen[key] = true
+			childScope := elementScope
+			if fields != nil {
+				var ok bool
+				childScope, ok = fields[key]
+				if !ok {
+					return fmt.Errorf("unknown or case-variant %s field", scope)
+				}
+			}
+			if err := checkJSON(dec, childScope); err != nil {
+				return err
+			}
+		}
+	case json.Delim('['):
+		for dec.More() {
+			if err := checkJSON(dec, elementScope); err != nil {
+				return err
+			}
+		}
+	default:
+		return nil
+	}
+	if _, err := dec.Token(); err != nil {
+		return errors.New("invalid JSON")
+	}
+	return nil
 }
 
 func (c *Config) Validate() error {
@@ -132,6 +233,20 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate tool name %q", t.Name)
 		}
 		toolNames[t.Name] = struct{}{}
+		if t.Version == "" {
+			t.Version = "1"
+		}
+		if !validToolName(t.Version) {
+			return fmt.Errorf("tool %q version must use only letters, digits, '.', '_' or '-' and be at most 128 characters", t.Name)
+		}
+		if t.State == "" {
+			t.State = "active"
+		}
+		switch t.State {
+		case "active", "deprecated", "disabled":
+		default:
+			return fmt.Errorf("tool %q state must be active, deprecated or disabled", t.Name)
+		}
 		t.Method = strings.ToUpper(strings.TrimSpace(t.Method))
 		if t.Method != "GET" && t.Method != "POST" && t.Method != "PUT" && t.Method != "PATCH" && t.Method != "DELETE" {
 			return fmt.Errorf("tool %q has unsupported HTTP method %q", t.Name, t.Method)
@@ -140,14 +255,8 @@ func (c *Config) Validate() error {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
 			return fmt.Errorf("tool %q endpoint must be an absolute http(s) URL without user info", t.Name)
 		}
-		if len(t.InputSchema) == 0 || !json.Valid(t.InputSchema) {
-			return fmt.Errorf("tool %q input_schema must be valid JSON", t.Name)
-		}
-		var schema struct {
-			Type string `json:"type"`
-		}
-		if err := json.Unmarshal(t.InputSchema, &schema); err != nil || schema.Type != "object" {
-			return fmt.Errorf("tool %q input_schema must have type object", t.Name)
+		if err := validateInputSchema(t.InputSchema); err != nil {
+			return fmt.Errorf("tool %q %w", t.Name, err)
 		}
 		if fileCredentials && t.BackendTokenEnv != "" {
 			return fmt.Errorf("tool %q backend_token_env must be empty when credentials_file is set", t.Name)
@@ -196,6 +305,69 @@ func (c *Config) Validate() error {
 }
 
 func (c Config) Timeout() time.Duration { return c.requestTimeout }
+
+// Revision hashes a validated config without rounding schema numbers through float64.
+func (c Config) Revision() string {
+	data, err := json.Marshal(c)
+	if err != nil {
+		return ""
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var value any
+	if err := dec.Decode(&value); err != nil {
+		return ""
+	}
+	canonical, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(canonical))
+}
+
+// Clone returns a config with independently owned slices and raw schemas.
+func (c Config) Clone() Config {
+	c.Clients = slices.Clone(c.Clients)
+	for i := range c.Clients {
+		c.Clients[i].AllowedTools = slices.Clone(c.Clients[i].AllowedTools)
+	}
+	c.Tools = slices.Clone(c.Tools)
+	for i := range c.Tools {
+		c.Tools[i].InputSchema = bytes.Clone(c.Tools[i].InputSchema)
+	}
+	return c
+}
+
+func validateInputSchema(data json.RawMessage) (err error) {
+	// SDK registration panics must reject releases without exposing schema contents.
+	defer func() {
+		if recover() != nil {
+			err = errors.New("input_schema could not be compiled")
+		}
+	}()
+	if len(data) == 0 || !json.Valid(data) {
+		return errors.New("input_schema must be valid JSON")
+	}
+	var object map[string]json.RawMessage
+	var schemaType string
+	if json.Unmarshal(data, &object) != nil || json.Unmarshal(object["type"], &schemaType) != nil || schemaType != "object" {
+		return errors.New("input_schema must have type object")
+	}
+	var schema jsonschema.Schema
+	if err := json.Unmarshal(data, &schema); err != nil {
+		return errors.New("input_schema is not a valid JSON Schema")
+	}
+	if _, err := schema.Resolve(&jsonschema.ResolveOptions{ValidateDefaults: true}); err != nil {
+		return errors.New("input_schema cannot be resolved or has invalid defaults")
+	}
+	// SDK-specific schema annotations have additional registration-time checks.
+	server := mcp.NewServer(&mcp.Implementation{Name: "config-validation", Version: "1"}, nil)
+	mcp.AddTool(server, &mcp.Tool{Name: "validation", InputSchema: data},
+		func(context.Context, *mcp.CallToolRequest, map[string]any) (*mcp.CallToolResult, any, error) {
+			return nil, nil, nil
+		})
+	return nil
+}
 
 func validateEnvName(name string) error {
 	if name == "" {
