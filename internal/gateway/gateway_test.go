@@ -218,6 +218,7 @@ func TestHiddenToolCallsDoNotRevealSchemasOrReachBackend(t *testing.T) {
 	wantAudits := map[string]int{"alpha:beta_tool": 2, "beta:alpha_tool": 2, "alpha:unassigned_tool": 1}
 	for _, line := range strings.Split(strings.TrimSpace(f.audit.String()), "\n") {
 		var event struct {
+			Event     string `json:"event"`
 			ClientID  string `json:"client_id"`
 			Tool      string `json:"tool"`
 			Outcome   string `json:"outcome"`
@@ -225,6 +226,9 @@ func TestHiddenToolCallsDoNotRevealSchemasOrReachBackend(t *testing.T) {
 		}
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
 			t.Fatal(err)
+		}
+		if event.Event != "tool_call" || event.Outcome == "unknown_tool" {
+			continue
 		}
 		if event.Outcome != "tool_denied" || event.RequestID == "" {
 			t.Errorf("unexpected audit event: %s", line)

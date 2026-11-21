@@ -2,9 +2,7 @@ package gateway
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +21,7 @@ import (
 
 type Gateway struct {
 	cfg        config.Config
+	revision   string
 	logger     *slog.Logger
 	client     *http.Client
 	identities map[string]clientIdentity
@@ -47,15 +46,32 @@ type identityContextKey struct{}
 type requestIDContextKey struct{}
 
 func New(cfg config.Config, logger *slog.Logger) (*Gateway, error) {
+	g, err := newGateway(cfg, logger, newMetrics(), nil)
+	if err == nil {
+		g.metrics.setRevision(g.revision)
+		g.metrics.setLimit(cap(g.toolSlots))
+	}
+	return g, err
+}
+
+func newGateway(cfg config.Config, logger *slog.Logger, metrics *metrics, slots chan struct{}) (*Gateway, error) {
+	cfg = cfg.Clone()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if slots == nil {
+		slots = make(chan struct{}, cfg.MaxConcurrentToolCalls)
+	}
 	g := &Gateway{
 		cfg:        cfg,
+		revision:   cfg.Revision(),
 		logger:     logger,
 		identities: make(map[string]clientIdentity, len(cfg.Clients)),
-		metrics:    newMetrics(),
-		toolSlots:  make(chan struct{}, cfg.MaxConcurrentToolCalls),
+		metrics:    metrics,
+		toolSlots:  slots,
 		client: &http.Client{
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
@@ -84,36 +100,30 @@ func New(cfg config.Config, logger *slog.Logger) (*Gateway, error) {
 	for _, credential := range g.identities {
 		server := mcp.NewServer(&mcp.Implementation{Name: cfg.ServerName, Version: cfg.ServerVersion}, nil)
 		for _, toolCfg := range cfg.Tools {
-			if _, allowed := credential.allowed[toolCfg.Name]; !allowed {
+			if _, allowed := credential.allowed[toolCfg.Name]; !allowed || toolCfg.State == "disabled" {
 				continue
 			}
 			tool := &mcp.Tool{
 				Name:        toolCfg.Name,
 				Description: toolCfg.Description,
 				InputSchema: json.RawMessage(toolCfg.InputSchema),
+				Meta: mcp.Meta{
+					"gateway/version": toolCfg.Version,
+					"gateway/state":   toolCfg.State,
+				},
 			}
-			mcp.AddTool(server, tool, func(ctx context.Context, _ *mcp.CallToolRequest, input map[string]any) (*mcp.CallToolResult, any, error) {
+			if err := registerTool(server, tool, func(ctx context.Context, _ *mcp.CallToolRequest, input map[string]any) (*mcp.CallToolResult, any, error) {
 				arguments, err := json.Marshal(input)
 				if err != nil {
 					return nil, nil, fmt.Errorf("encode validated tool input: %w", err)
 				}
 				result, err := g.callTool(ctx, toolCfg, arguments)
 				return result, nil, err
-			})
-		}
-		server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
-			return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
-				// Hidden tools never reach callTool, so retain denial audits before SDK dispatch.
-				if call, ok := req.(*mcp.CallToolRequest); ok && call.Params != nil {
-					if _, allowed := credential.allowed[call.Params.Name]; !allowed {
-						if tool, known := toolsByName[call.Params.Name]; known {
-							g.logCall(ctx, credential.id, tool, 0, false, time.Now(), "tool_denied")
-						}
-					}
-				}
-				return next(ctx, method, req)
+			}); err != nil {
+				return nil, err
 			}
-		})
+		}
+		server.AddReceivingMiddleware(g.auditRPC(credential, toolsByName))
 		servers[credential.id] = server
 	}
 	g.mcpHandler = mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
@@ -126,6 +136,16 @@ func New(cfg config.Config, logger *slog.Logger) (*Gateway, error) {
 	return g, nil
 }
 
+func registerTool(server *mcp.Server, tool *mcp.Tool, handler mcp.ToolHandlerFor[map[string]any, any]) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("configured tool could not be registered")
+		}
+	}()
+	mcp.AddTool(server, tool, handler)
+	return nil
+}
+
 func (g *Gateway) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -134,9 +154,12 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	mux.Handle("GET /metrics", http.HandlerFunc(g.handleMetrics))
-	mux.Handle("/mcp", http.HandlerFunc(g.handleMCP))
-	return requestIDMiddleware(mux)
+	mux.HandleFunc("GET /metrics", g.handleMetrics)
+	mux.HandleFunc("/mcp", g.handleMCP)
+	return requestIDMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Config-Revision", g.revision)
+		g.auditHTTP(metricRoute(r.URL.Path), mux).ServeHTTP(w, r)
+	}))
 }
 
 func (g *Gateway) handleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -164,9 +187,15 @@ func (g *Gateway) handleMCP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	if observation, ok := r.Context().Value(httpObservationKey{}).(*httpObservation); ok {
+		observation.clientID = credential.id
+	}
 	ctx := context.WithValue(r.Context(), identityContextKey{}, credential)
 	r = r.WithContext(ctx)
 	r.Body = http.MaxBytesReader(w, r.Body, g.cfg.MaxRequestBytes)
+	if observation, ok := ctx.Value(httpObservationKey{}).(*httpObservation); ok {
+		r.Body = &observedBody{ReadCloser: r.Body, observation: observation}
+	}
 	g.mcpHandler.ServeHTTP(w, r)
 }
 
@@ -194,17 +223,29 @@ func (g *Gateway) callTool(ctx context.Context, tool config.Tool, arguments json
 		return toolError("missing authenticated client"), nil
 	}
 	if _, allowed := identity.allowed[tool.Name]; !allowed {
-		g.logCall(ctx, identity.id, tool, 0, false, started, "tool_denied")
+		g.logCall(ctx, identity.id, tool, 0, started, "tool_denied")
 		return toolError("client is not allowed to call this tool"), nil
+	}
+	if tool.State == "disabled" {
+		g.logCall(ctx, identity.id, tool, 0, started, "tool_disabled")
+		return toolError("tool is unavailable"), nil
+	}
+	if ctx.Err() != nil {
+		g.logCall(ctx, identity.id, tool, 0, started, "cancelled")
+		return toolError("tool call cancelled"), nil
 	}
 	select {
 	case g.toolSlots <- struct{}{}:
-		defer func() { <-g.toolSlots }()
+		g.metrics.addInFlight(1)
+		defer func() {
+			g.metrics.addInFlight(-1)
+			<-g.toolSlots
+		}()
 	case <-ctx.Done():
-		g.logCall(ctx, identity.id, tool, 0, false, started, "cancelled")
+		g.logCall(ctx, identity.id, tool, 0, started, "cancelled")
 		return toolError("tool call cancelled"), nil
 	default:
-		g.logCall(ctx, identity.id, tool, 0, false, started, "overloaded")
+		g.logCall(ctx, identity.id, tool, 0, started, "overloaded")
 		return toolError("tool gateway is at its configured concurrency limit"), nil
 	}
 
@@ -212,14 +253,25 @@ func (g *Gateway) callTool(ctx context.Context, tool config.Tool, arguments json
 	defer cancel()
 	result, status, err := g.forward(callCtx, tool, arguments, identity.credentials)
 	if err != nil {
-		g.logCall(ctx, identity.id, tool, status, false, started, "upstream_error")
+		g.logCall(ctx, identity.id, tool, status, started, failureOutcome(err))
 		return toolError(err.Error()), nil
 	}
-	g.logCall(ctx, identity.id, tool, status, true, started, "success")
+	g.logCall(ctx, identity.id, tool, status, started, "success")
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(result)}}}, nil
 }
 
-func (g *Gateway) forward(ctx context.Context, tool config.Tool, arguments json.RawMessage, credentials *credentialSnapshot) ([]byte, int, error) {
+func (g *Gateway) forward(ctx context.Context, tool config.Tool, arguments json.RawMessage, credentials *credentialSnapshot) (data []byte, status int, err error) {
+	ctx = childTraceContext(ctx)
+	started := time.Now()
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = failureOutcome(err)
+		}
+		g.emitAudit(ctx, "upstream request completed", "upstream_request",
+			"tool", tool.Name, "tool_version", tool.Version, "method", tool.Method,
+			"status", status, "outcome", outcome, "duration_ms", time.Since(started).Milliseconds())
+	}()
 	endpoint, err := url.Parse(tool.Endpoint)
 	if err != nil {
 		return nil, 0, errors.New("configured tool endpoint is invalid")
@@ -259,7 +311,7 @@ func (g *Gateway) forward(ctx context.Context, tool config.Tool, arguments json.
 	if tool.BackendTokenRequired || tool.BackendTokenEnv != "" {
 		credential, ok := credentials.Backends[tool.Name]
 		if !ok || !credential.active(time.Now()) {
-			return nil, 0, errors.New("backend credential is unavailable")
+			return nil, 0, &callFailure{"backend_credential_unavailable", "backend credential is unavailable"}
 		}
 		req.Header.Set("Authorization", "Bearer "+credential.Token)
 	}
@@ -267,26 +319,23 @@ func (g *Gateway) forward(ctx context.Context, tool config.Tool, arguments json.
 		req.Header.Set("X-Request-ID", requestID)
 	}
 
+	if trace, ok := ctx.Value(traceContextKey{}).(traceContext); ok {
+		req.Header.Set("traceparent", trace.header())
+	}
 	resp, err := g.client.Do(req)
 	if err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return nil, 0, errors.New("upstream request timed out")
-		}
-		if errors.Is(ctx.Err(), context.Canceled) {
-			return nil, 0, errors.New("upstream request cancelled")
-		}
-		return nil, 0, errors.New("upstream request failed")
+		return nil, 0, upstreamFailure(ctx, "upstream request failed")
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, g.cfg.MaxResponseBytes+1))
+	data, err = io.ReadAll(io.LimitReader(resp.Body, g.cfg.MaxResponseBytes+1))
 	if err != nil {
-		return nil, resp.StatusCode, errors.New("read upstream response")
+		return nil, resp.StatusCode, upstreamFailure(ctx, "read upstream response")
 	}
 	if int64(len(data)) > g.cfg.MaxResponseBytes {
-		return nil, resp.StatusCode, errors.New("upstream response exceeded the configured size limit")
+		return nil, resp.StatusCode, &callFailure{"response_too_large", "upstream response exceeded the configured size limit"}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, resp.StatusCode, fmt.Errorf("upstream returned HTTP %d", resp.StatusCode)
+		return nil, resp.StatusCode, &callFailure{"upstream_http_error", fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode)}
 	}
 	return data, resp.StatusCode, nil
 }
@@ -302,21 +351,12 @@ func queryValue(raw json.RawMessage) (string, error) {
 	return string(raw), nil
 }
 
-func (g *Gateway) logCall(ctx context.Context, clientID string, tool config.Tool, status int, success bool, started time.Time, outcome string) {
-	elapsed := time.Since(started)
-	g.metrics.record(tool.Name, success, elapsed)
-	attrs := []any{
-		"client_id", clientID,
-		"tool", tool.Name,
-		"method", tool.Method,
-		"status", status,
-		"outcome", outcome,
-		"duration_ms", elapsed.Milliseconds(),
+func (g *Gateway) logCall(ctx context.Context, clientID string, tool config.Tool, status int, started time.Time, outcome string) {
+	if observation, ok := ctx.Value(toolObservationKey{}).(*toolObservation); ok {
+		observation.outcome, observation.status = outcome, status
+		return
 	}
-	if requestID, ok := ctx.Value(requestIDContextKey{}).(string); ok {
-		attrs = append(attrs, "request_id", requestID)
-	}
-	g.logger.Info("tool call completed", attrs...)
+	g.completeToolAudit(ctx, clientID, tool, status, started, outcome)
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -337,17 +377,4 @@ func bearerToken(header string) string {
 
 func constantTimeTokenMatch(provided, expected string) bool {
 	return len(provided) == len(expected) && subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
-}
-
-func requestIDMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var idBytes [16]byte
-		if _, err := rand.Read(idBytes[:]); err != nil {
-			copy(idBytes[:], []byte(fmt.Sprintf("%016x", time.Now().UnixNano())))
-		}
-		requestID := hex.EncodeToString(idBytes[:])
-		w.Header().Set("X-Request-ID", requestID)
-		r = r.WithContext(context.WithValue(r.Context(), requestIDContextKey{}, requestID))
-		next.ServeHTTP(w, r)
-	})
 }

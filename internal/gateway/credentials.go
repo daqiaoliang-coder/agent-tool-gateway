@@ -230,12 +230,22 @@ func (c *tokenCredential) validate(minLength int) error {
 	return nil
 }
 
-func (g *Gateway) ReloadCredentials() error {
+func (g *Gateway) ReloadCredentials() (err error) {
+	g.reloadMu.Lock()
+	defer g.reloadMu.Unlock()
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = "rejected"
+			g.logger.Error("credential reload rejected; previous credentials remain active", "event", "credential_reload", "outcome", outcome, "config_revision", g.revision)
+		} else {
+			g.logger.Info("credentials reloaded", "event", "credential_reload", "outcome", outcome, "config_revision", g.revision)
+		}
+		g.metrics.recordReload("credentials", outcome)
+	}()
 	if g.cfg.CredentialsFile == "" {
 		return errors.New("credential reload requires credentials_file; environment credentials require a restart")
 	}
-	g.reloadMu.Lock()
-	defer g.reloadMu.Unlock()
 	snapshot, err := loadCredentialFile(g.cfg)
 	if err != nil {
 		return err
